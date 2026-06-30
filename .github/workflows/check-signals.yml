@@ -1,0 +1,27 @@
+name: S50 Check Signals
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+    inputs:
+      timeframe:
+        description: 'Timeframe to check'
+        required: true
+        default: '5m'
+        type: choice
+        options: ['1m', '5m', '15m']
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    strategy:
+      matrix:
+        tf: ['1m', '5m', '15m']
+    steps:
+      - name: Check ${{ matrix.tf }} signals
+        run: |
+          URL="https://s50-forward-test.vercel.app/api/cron/check-signals?tf=${{ matrix.tf }}"
+          echo "Calling: $URL"
+          curl -s --max-time 60 "$URL" || echo "Request failed (timeout or error)"
