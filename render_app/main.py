@@ -2,8 +2,6 @@ import os
 from datetime import datetime, timezone
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, HTMLResponse
-from fastapi.templating import Jinja2Templates
-from pathlib import Path
 
 from .yahoo_data import fetch_bars
 from .strategy import (
@@ -13,7 +11,6 @@ from .strategy import (
 from .supabase_db import get_db
 
 app = FastAPI()
-templates = Jinja2Templates(directory=Path(__file__).parent / 'templates')
 
 CAPITAL = 15000
 MAX_TRADES_PER_DAY = 10
@@ -288,74 +285,149 @@ async def check_signals(request: Request):
 
 
 @app.get('/', response_class=HTMLResponse)
-async def dashboard(request: Request):
+async def dashboard():
     try:
         supabase = get_db()
     except RuntimeError:
         return HTMLResponse('<h1>Missing Supabase env vars</h1>', status_code=500)
 
-    # Fetch data
-    trades_resp = supabase.table('trades').select('*').order('exited_at', desc=True).limit(100).execute()
-    signals_resp = supabase.table('signals').select('*').order('detected_at', desc=True).limit(100).execute()
-    open_resp = supabase.table('open_positions').select('*').execute()
+    trades = (supabase.table('trades').select('*').order('exited_at', desc=True).limit(100).execute()).data or []
+    signals = (supabase.table('signals').select('*').order('detected_at', desc=True).limit(100).execute()).data or []
+    open_pos = (supabase.table('open_positions').select('*').execute()).data or []
 
-    trades = trades_resp.data or []
-    signals = signals_resp.data or []
-    open_positions = open_resp.data or []
-
-    # Aggregate summary
-    total_trades = len(trades)
+    total = len(trades)
     wins = sum(1 for t in trades if float(t['pnl']) > 0)
-    losses = sum(1 for t in trades if float(t['pnl']) <= 0)
-    gross_pnl = sum(float(t['pnl']) for t in trades)
-    net_pnl = sum(float(t['net_pnl']) for t in trades)
-    total_signals = len(signals)
-    win_rate = round(wins / total_trades * 100) if total_trades > 0 else 0
-
-    gross_wins = sum(float(t['pnl']) for t in trades if float(t['pnl']) > 0)
-    gross_losses = abs(sum(float(t['pnl']) for t in trades if float(t['pnl']) < 0))
-    profit_factor = round(gross_wins / gross_losses, 2) if gross_losses > 0 else (gross_wins if gross_wins > 0 else 0)
+    gp = sum(float(t['pnl']) for t in trades)
+    np = sum(float(t['net_pnl']) for t in trades)
+    wr = round(wins / total * 100) if total else 0
+    gw = sum(float(t['pnl']) for t in trades if float(t['pnl']) > 0)
+    gl = abs(sum(float(t['pnl']) for t in trades if float(t['pnl']) < 0))
+    pf = round(gw / gl, 2) if gl else (gw if gw else 0)
 
     def fmt(v):
-        prefix = '+' if v >= 0 else ''
-        return f'{prefix}{v:,.2f}'
+        p = '+' if v >= 0 else ''
+        return p + f'{v:,.2f}'
 
-    summary = {
-        'total_trades': total_trades,
-        'gross_pnl': gross_pnl,
-        'gross_pnl_str': fmt(gross_pnl),
-        'net_pnl': net_pnl,
-        'net_pnl_str': fmt(net_pnl),
-        'win_rate': win_rate,
-        'profit_factor': profit_factor,
-        'total_signals': total_signals,
-    }
-
-    # By timeframe
-    by_tf = {}
+    rows_tf = ''
     for tf in ['1m', '5m', '15m']:
-        tf_trades = [t for t in trades if t['timeframe'] == tf]
-        tf_wins = sum(1 for t in tf_trades if float(t['pnl']) > 0)
-        tf_losses = sum(1 for t in tf_trades if float(t['pnl']) <= 0)
-        tf_gross = sum(float(t['pnl']) for t in tf_trades)
-        tf_net = sum(float(t['net_pnl']) for t in tf_trades)
-        by_tf[tf] = {
-            'signals': len([s for s in signals if s['timeframe'] == tf]),
-            'trades': len(tf_trades),
-            'wins': tf_wins,
-            'losses': tf_losses,
-            'gross_pnl': tf_gross,
-            'gross_pnl_str': fmt(tf_gross),
-            'net_pnl': tf_net,
-            'net_pnl_str': fmt(tf_net),
-            'win_rate': round(tf_wins / len(tf_trades) * 100) if tf_trades else 0,
-        }
+        tt = [t for t in trades if t['timeframe'] == tf]
+        tw = sum(1 for t in tt if float(t['pnl']) > 0)
+        tl = len(tt) - tw
+        tg = sum(float(t['pnl']) for t in tt)
+        tn = sum(float(t['net_pnl']) for t in tt)
+        ts = len([s for s in signals if s['timeframe'] == tf])
+        twr = round(tw / len(tt) * 100) if tt else 0
+        tgc = 'green' if tg >= 0 else 'red'
+        tnc = 'green' if tn >= 0 else 'red'
+        rows_tf += f'<tr><td><strong>{tf}</strong></td><td>{ts}</td><td>{len(tt)}</td>'
+        rows_tf += f'<td class="green">{tw}</td><td class="red">{tl}</td>'
+        rows_tf += f'<td class="{tgc}">{fmt(tg)}</td><td class="{tnc}">{fmt(tn)}</td><td>{twr}%</td></tr>'
 
-    return templates.TemplateResponse('dashboard.html', {
-        'request': request,
-        'summary': summary,
-        'by_tf': by_tf,
-        'trades': trades,
-        'signals': signals,
-        'open_positions': open_positions,
-    })
+    rows_open = ''
+    for p in open_pos:
+        rows_open += f'<tr><td>{p["entered_at"][:16]}</td><td>{p["timeframe"]}</td>'
+        rows_open += f'<td><span class="badge {p["direction"].lower()}">{p["direction"]}</span></td>'
+        rows_open += f'<td>{p["entry_price"]}</td><td>{p["sl_price"]}</td><td>{p["tp_price"]}</td><td>{p["quantity"]}</td></tr>'
+
+    rows_sig = ''
+    for s in signals:
+        vwap_str = f'{float(s["vwap"]):.2f}' if s.get('vwap') else '-'
+        rows_sig += f'<tr><td>{s["bar_time"][:16]}</td><td>{s["timeframe"]}</td>'
+        rows_sig += f'<td><span class="badge {s["direction"].lower()}">{s["direction"]}</span></td>'
+        rows_sig += f'<td>{s["entry_price"]}</td><td>{s["sl_price"]}</td><td>{s["tp_price"]}</td>'
+        rows_sig += f'<td>{vwap_str}</td><td>{s["volume"]}</td>'
+        rows_sig += f'<td><span class="badge {s["status"]}">{s["status"]}</span></td></tr>'
+
+    rows_tr = ''
+    for t in trades:
+        pnl_c = 'green' if float(t['pnl']) >= 0 else 'red'
+        net_c = 'green' if float(t['net_pnl']) >= 0 else 'red'
+        rows_tr += f'<tr><td>{t["exited_at"][:16]}</td><td>{t["timeframe"]}</td>'
+        rows_tr += f'<td><span class="badge {t["direction"].lower()}">{t["direction"]}</span></td>'
+        rows_tr += f'<td>{t["entry_price"]}</td><td>{t["exit_price"]}</td><td>{t["quantity"]}</td>'
+        rows_tr += f'<td class="{pnl_c}">{float(t["pnl"]):.2f}</td>'
+        rows_tr += f'<td class="{net_c}">{float(t["net_pnl"]):.2f}</td>'
+        rows_tr += f'<td>{t["exit_reason"]}</td></tr>'
+
+    open_section = ''
+    if open_pos:
+        open_section = '<h2 class="st">Open Positions</h2><table><thead><tr>'
+        open_section += '<th>Time</th><th>TF</th><th>Dir</th><th>Entry</th><th>SL</th><th>TP</th><th>Qty</th></tr></thead><tbody>'
+        open_section += rows_open + '</tbody></table>'
+    else:
+        open_section = '<h2 class="st">Open Positions</h2><p class="empty">No open positions</p>'
+
+    sig_section = '<h2 class="st">Signals Log</h2>'
+    if signals:
+        sig_section += '<table><thead><tr><th>Time</th><th>TF</th><th>Dir</th><th>Entry</th><th>SL</th><th>TP</th><th>VWAP</th><th>Vol</th><th>Status</th></tr></thead><tbody>'
+        sig_section += rows_sig + '</tbody></table>'
+    else:
+        sig_section += '<p class="empty">No signals yet</p>'
+
+    trades_section = '<h2 class="st">Trade Log</h2>'
+    if trades:
+        trades_section += '<table><thead><tr><th>Exited</th><th>TF</th><th>Dir</th><th>Entry</th><th>Exit</th><th>Qty</th><th>PnL</th><th>Net</th><th>Why</th></tr></thead><tbody>'
+        trades_section += rows_tr + '</tbody></table>'
+    else:
+        trades_section += '<p class="empty">No trades yet</p>'
+
+    gpc = 'green' if gp >= 0 else 'red'
+    npc = 'green' if np >= 0 else 'red'
+
+    html = '<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">'
+    html += '<meta name="viewport" content="width=device-width,initial-scale=1.0">'
+    html += '<title>S50 Forward Test</title><style>'
+    html += '*{margin:0;padding:0;box-sizing:border-box}'
+    html += 'body{font-family:-apple-system,BlinkMacSystemFont,\'Segoe UI\',Roboto,sans-serif;background:#0f172a;color:#e2e8f0}'
+    html += '.container{max-width:1200px;margin:0 auto;padding:20px}'
+    html += 'h1{font-size:1.5rem;margin-bottom:8px;color:#f8fafc}'
+    html += '.subtitle{color:#94a3b8;font-size:0.85rem;margin-bottom:24px}'
+    html += '.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin-bottom:24px}'
+    html += '.card{background:#1e293b;border-radius:8px;padding:16px;border:1px solid #334155}'
+    html += '.card .l{font-size:0.75rem;color:#94a3b8;text-transform:uppercase;letter-spacing:0.05em}'
+    html += '.card .v{font-size:1.5rem;font-weight:700;margin-top:4px}'
+    html += '.green{color:#22c55e}.red{color:#ef4444}.blue{color:#3b82f6}'
+    html += '.tabs{display:flex;gap:4px;margin-bottom:16px;border-bottom:1px solid #334155}'
+    html += '.tab{padding:10px 20px;cursor:pointer;border:none;background:none;color:#94a3b8;font-size:0.9rem;border-bottom:2px solid transparent}'
+    html += '.tab.active{color:#3b82f6;border-bottom-color:#3b82f6}'
+    html += 'table{width:100%;border-collapse:collapse;font-size:0.85rem}'
+    html += 'th{text-align:left;padding:10px 8px;border-bottom:2px solid #334155;color:#94a3b8;font-weight:600;white-space:nowrap}'
+    html += 'td{padding:8px;border-bottom:1px solid #1e293b;white-space:nowrap}'
+    html += '.badge{padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:600}'
+    html += '.badge.buy{background:#166534;color:#86efac}'
+    html += '.badge.sell{background:#7f1d1d;color:#fca5a5}'
+    html += '.badge.active{background:#1e3a5f;color:#93c5fd}'
+    html += '.badge.closed{background:#374151;color:#cbd5e1}'
+    html += '.st{font-size:1.1rem;margin-bottom:12px;margin-top:24px;color:#f8fafc}'
+    html += '.c{display:none}.c.active{display:block}'
+    html += '.empty{color:#64748b;font-style:italic;padding:20px 0}'
+    html += '</style></head><body><div class="container">'
+    html += '<h1>S50 Forward Test</h1>'
+    html += f'<p class="subtitle">IDEA.NS &middot; {total} trades &middot; {wr}% win rate &middot; {fmt(np)}</p>'
+    html += '<div class="grid">'
+    html += f'<div class="card"><div class="l">Gross P&amp;L</div><div class="v {gpc}">{fmt(gp)}</div></div>'
+    html += f'<div class="card"><div class="l">Net P&amp;L</div><div class="v {npc}">{fmt(np)}</div></div>'
+    html += f'<div class="card"><div class="l">Win Rate</div><div class="v blue">{wr}%</div></div>'
+    html += f'<div class="card"><div class="l">Profit Factor</div><div class="v blue">{pf}</div></div>'
+    html += f'<div class="card"><div class="l">Total Trades</div><div class="v blue">{total}</div></div>'
+    html += f'<div class="card"><div class="l">Total Signals</div><div class="v blue">{len(signals)}</div></div>'
+    html += '</div>'
+    html += '<div class="tabs">'
+    html += '<button class="tab active" onclick="st(\'d\')">Dashboard</button>'
+    html += '<button class="tab" onclick="st(\'s\')">Signals</button>'
+    html += '<button class="tab" onclick="st(\'t\')">Trades</button>'
+    html += '</div>'
+    html += '<div class="tabs-sections">'
+    html += '<div id="d" class="c active">'
+    html += '<h2 class="st">By Timeframe</h2>'
+    html += '<table><thead><tr><th>TF</th><th>Sig</th><th>Tr</th><th>W</th><th>L</th><th>Gross</th><th>Net</th><th>WR</th></tr></thead><tbody>'
+    html += rows_tf + '</tbody></table>'
+    html += open_section + '</div>'
+    html += '<div id="s" class="c">' + sig_section + '</div>'
+    html += '<div id="t" class="c">' + trades_section + '</div>'
+    html += '</div></div>'
+    html += '<script>function st(i){document.querySelectorAll(\'.c\').forEach(e=>e.classList.remove(\'active\'));'
+    html += 'document.querySelectorAll(\'.tab\').forEach(e=>e.classList.remove(\'active\'));'
+    html += 'document.getElementById(i).classList.add(\'active\');event.target.classList.add(\'active\')}'
+    html += '</script></body></html>'
+    return HTMLResponse(html)
