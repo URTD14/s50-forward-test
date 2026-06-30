@@ -20,9 +20,9 @@ const TF_INTERVALS: Record<string, string> = {
 }
 
 const TF_RANGES: Record<string, string> = {
-  '1m': '7d',
-  '5m': '2mo',
-  '15m': '2mo',
+  '1m': '5d',
+  '5m': '1mo',
+  '15m': '1mo',
 }
 
 export async function fetchBars(tf: string): Promise<Bar[]> {
