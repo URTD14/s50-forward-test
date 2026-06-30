@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>S50 Forward Test</title>
+<style>
+  *{margin:0;padding:0;box-sizing:border-box}
+  body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0f172a;color:#e2e8f0;min-height:100vh}
+  .container{max-width:1200px;margin:0 auto;padding:20px}
+  h1{font-size:1.5rem;margin-bottom:8px;color:#f8fafc}
+  .subtitle{color:#94a3b8;font-size:0.85rem;margin-bottom:24px}
+  .summary-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin-bottom:24px}
+  .card{background:#1e293b;border-radius:8px;padding:16px;border:1px solid #334155}
+  .card .label{font-size:0.75rem;color:#94a3b8;text-transform:uppercase;letter-spacing:0.05em}
+  .card .value{font-size:1.5rem;font-weight:700;margin-top:4px}
+  .value.green{color:#22c55e}.value.red{color:#ef4444}.value.blue{color:#3b82f6}
+  .tabs{display:flex;gap:4px;margin-bottom:16px;border-bottom:1px solid #334155}
+  .tab{padding:10px 20px;cursor:pointer;border:none;background:none;color:#94a3b8;font-size:0.9rem;border-bottom:2px solid transparent}
+  .tab.active{color:#3b82f6;border-bottom-color:#3b82f6}
+  .tab:hover{color:#e2e8f0}
+  table{width:100%;border-collapse:collapse;font-size:0.85rem}
+  th{text-align:left;padding:10px 8px;border-bottom:2px solid #334155;color:#94a3b8;font-weight:600;white-space:nowrap}
+  td{padding:8px;border-bottom:1px solid #1e293b;white-space:nowrap}
+  .badge{padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:600}
+  .badge.buy{background:#166534;color:#86efac}
+  .badge.sell{background:#7f1d1d;color:#fca5a5}
+  .badge.active{background:#1e3a5f;color:#93c5fd}
+  .badge.closed{background:#374151;color:#cbd5e1}
+  .section-title{font-size:1.1rem;margin-bottom:12px;margin-top:24px;color:#f8fafc}
+  .content{display:none}
+  .content.active{display:block}
+  .empty{color:#64748b;font-style:italic;padding:20px 0}
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>S50 Forward Test</h1>
+  <p class="subtitle">IDEA.NS · {{ summary.total_trades }} trades · {{ summary.win_rate }}% win rate · {{ summary.net_pnl_str }}</p>
+
+  <div class="summary-grid">
+    <div class="card"><div class="label">Gross P&L</div><div class="value {{ 'green' if summary.gross_pnl >= 0 else 'red' }}">{{ summary.gross_pnl_str }}</div></div>
+    <div class="card"><div class="label">Net P&L (after costs)</div><div class="value {{ 'green' if summary.net_pnl >= 0 else 'red' }}">{{ summary.net_pnl_str }}</div></div>
+    <div class="card"><div class="label">Win Rate</div><div class="value blue">{{ summary.win_rate }}%</div></div>
+    <div class="card"><div class="label">Profit Factor</div><div class="value blue">{{ summary.profit_factor }}</div></div>
+    <div class="card"><div class="label">Total Trades</div><div class="value blue">{{ summary.total_trades }}</div></div>
+    <div class="card"><div class="label">Total Signals</div><div class="value blue">{{ summary.total_signals }}</div></div>
+  </div>
+
+  <div class="tabs">
+    <button class="tab active" onclick="switchTab('dashboard-tab')">Dashboard</button>
+    <button class="tab" onclick="switchTab('signals-tab')">Signals Log</button>
+    <button class="tab" onclick="switchTab('trades-tab')">Trade Log</button>
+  </div>
+
+  <div id="dashboard-tab" class="content active">
+    <h2 class="section-title">By Timeframe</h2>
+    <table>
+      <thead><tr><th>TF</th><th>Signals</th><th>Trades</th><th>Wins</th><th>Losses</th><th>Gross P&L</th><th>Net P&L</th><th>Win Rate</th></tr></thead>
+      <tbody>
+        {% for tf in ['1m','5m','15m'] %}
+        {% set row = by_tf[tf] %}
+        <tr>
+          <td><strong>{{ tf }}</strong></td>
+          <td>{{ row.signals }}</td>
+          <td>{{ row.trades }}</td>
+          <td class="value green">{{ row.wins }}</td>
+          <td class="value red">{{ row.losses }}</td>
+          <td class="{{ 'green' if row.gross_pnl >= 0 else 'red' }}">{{ row.gross_pnl_str }}</td>
+          <td class="{{ 'green' if row.net_pnl >= 0 else 'red' }}">{{ row.net_pnl_str }}</td>
+          <td>{{ row.win_rate }}%</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+
+    <h2 class="section-title">Open Positions</h2>
+    {% if open_positions %}
+    <table>
+      <thead><tr><th>Time</th><th>TF</th><th>Dir</th><th>Entry</th><th>SL</th><th>TP</th><th>Qty</th></tr></thead>
+      <tbody>
+        {% for p in open_positions %}
+        <tr>
+          <td>{{ p.entered_at[:16] }}</td>
+          <td>{{ p.timeframe }}</td>
+          <td><span class="badge {{ p.direction.lower() }}">{{ p.direction }}</span></td>
+          <td>{{ p.entry_price }}</td>
+          <td>{{ p.sl_price }}</td>
+          <td>{{ p.tp_price }}</td>
+          <td>{{ p.quantity }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+    <p class="empty">No open positions</p>
+    {% endif %}
+  </div>
+
+  <div id="signals-tab" class="content">
+    <table>
+      <thead><tr><th>Time</th><th>TF</th><th>Dir</th><th>Entry</th><th>SL</th><th>TP</th><th>VWAP</th><th>Vol</th><th>Status</th></tr></thead>
+      <tbody>
+        {% for s in signals %}
+        <tr>
+          <td>{{ s.bar_time[:16] }}</td>
+          <td>{{ s.timeframe }}</td>
+          <td><span class="badge {{ s.direction.lower() }}">{{ s.direction }}</span></td>
+          <td>{{ s.entry_price }}</td>
+          <td>{{ s.sl_price }}</td>
+          <td>{{ s.tp_price }}</td>
+          <td>{{ '%0.2f'|format(s.vwap|float) if s.vwap else '-' }}</td>
+          <td>{{ s.volume }}</td>
+          <td><span class="badge {{ s.status }}">{{ s.status }}</span></td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% if not signals %}<p class="empty">No signals yet</p>{% endif %}
+  </div>
+
+  <div id="trades-tab" class="content">
+    <table>
+      <thead><tr><th>Exit Time</th><th>TF</th><th>Dir</th><th>Entry</th><th>Exit</th><th>Qty</th><th>P&L</th><th>Net P&L</th><th>Reason</th></tr></thead>
+      <tbody>
+        {% for t in trades %}
+        <tr>
+          <td>{{ t.exited_at[:16] }}</td>
+          <td>{{ t.timeframe }}</td>
+          <td><span class="badge {{ t.direction.lower() }}">{{ t.direction }}</span></td>
+          <td>{{ t.entry_price }}</td>
+          <td>{{ t.exit_price }}</td>
+          <td>{{ t.quantity }}</td>
+          <td class="{{ 'green' if t.pnl|float >= 0 else 'red' }}">{{ '%0.2f'|format(t.pnl|float) }}</td>
+          <td class="{{ 'green' if t.net_pnl|float >= 0 else 'red' }}">{{ '%0.2f'|format(t.net_pnl|float) }}</td>
+          <td>{{ t.exit_reason }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% if not trades %}<p class="empty">No trades yet</p>{% endif %}
+  </div>
+</div>
+
+<script>
+function switchTab(id) {
+  document.querySelectorAll('.content').forEach(el => el.classList.remove('active'))
+  document.querySelectorAll('.tab').forEach(el => el.classList.remove('active'))
+  document.getElementById(id).classList.add('active')
+  event.target.classList.add('active')
+}
+</script>
+</body>
+</html>
