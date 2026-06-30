@@ -308,6 +308,12 @@ async def dashboard():
         p = '+' if v >= 0 else ''
         return p + f'{v:,.2f}'
 
+    pf_str = f'{pf:.2f}' if isinstance(pf, float) else str(pf)
+
+    def r2(x):
+        try: return f'{float(x):.2f}'
+        except: return str(x)
+
     rows_tf = ''
     for tf in ['1m', '5m', '15m']:
         tt = [t for t in trades if t['timeframe'] == tf]
@@ -327,14 +333,14 @@ async def dashboard():
     for p in open_pos:
         rows_open += f'<tr><td>{p["entered_at"][:16]}</td><td>{p["timeframe"]}</td>'
         rows_open += f'<td><span class="badge {p["direction"].lower()}">{p["direction"]}</span></td>'
-        rows_open += f'<td>{p["entry_price"]}</td><td>{p["sl_price"]}</td><td>{p["tp_price"]}</td><td>{p["quantity"]}</td></tr>'
+        rows_open += f'<td>{r2(p["entry_price"])}</td><td>{r2(p["sl_price"])}</td><td>{r2(p["tp_price"])}</td><td>{p["quantity"]}</td></tr>'
 
     rows_sig = ''
     for s in signals:
         vwap_str = f'{float(s["vwap"]):.2f}' if s.get('vwap') else '-'
         rows_sig += f'<tr><td>{s["bar_time"][:16]}</td><td>{s["timeframe"]}</td>'
         rows_sig += f'<td><span class="badge {s["direction"].lower()}">{s["direction"]}</span></td>'
-        rows_sig += f'<td>{s["entry_price"]}</td><td>{s["sl_price"]}</td><td>{s["tp_price"]}</td>'
+        rows_sig += f'<td>{r2(s["entry_price"])}</td><td>{r2(s["sl_price"])}</td><td>{r2(s["tp_price"])}</td>'
         rows_sig += f'<td>{vwap_str}</td><td>{s["volume"]}</td>'
         rows_sig += f'<td><span class="badge {s["status"]}">{s["status"]}</span></td></tr>'
 
@@ -344,7 +350,7 @@ async def dashboard():
         net_c = 'green' if float(t['net_pnl']) >= 0 else 'red'
         rows_tr += f'<tr><td>{t["exited_at"][:16]}</td><td>{t["timeframe"]}</td>'
         rows_tr += f'<td><span class="badge {t["direction"].lower()}">{t["direction"]}</span></td>'
-        rows_tr += f'<td>{t["entry_price"]}</td><td>{t["exit_price"]}</td><td>{t["quantity"]}</td>'
+        rows_tr += f'<td>{r2(t["entry_price"])}</td><td>{r2(t["exit_price"])}</td><td>{t["quantity"]}</td>'
         rows_tr += f'<td class="{pnl_c}">{float(t["pnl"]):.2f}</td>'
         rows_tr += f'<td class="{net_c}">{float(t["net_pnl"]):.2f}</td>'
         rows_tr += f'<td>{t["exit_reason"]}</td></tr>'
@@ -408,7 +414,7 @@ async def dashboard():
     html += f'<div class="card"><div class="l">Gross P&amp;L</div><div class="v {gpc}">{fmt(gp)}</div></div>'
     html += f'<div class="card"><div class="l">Net P&amp;L</div><div class="v {npc}">{fmt(np)}</div></div>'
     html += f'<div class="card"><div class="l">Win Rate</div><div class="v blue">{wr}%</div></div>'
-    html += f'<div class="card"><div class="l">Profit Factor</div><div class="v blue">{pf}</div></div>'
+    html += f'<div class="card"><div class="l">Profit Factor</div><div class="v blue">{pf_str}</div></div>'
     html += f'<div class="card"><div class="l">Total Trades</div><div class="v blue">{total}</div></div>'
     html += f'<div class="card"><div class="l">Total Signals</div><div class="v blue">{len(signals)}</div></div>'
     html += '</div>'
