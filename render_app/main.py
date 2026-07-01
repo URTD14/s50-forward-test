@@ -19,64 +19,58 @@ TF_MS = {'1m': 60000, '5m': 300000, '15m': 900000}
 SKIP_FIRST_N_BARS = 20
 
 
-@app.get('/api/cron/check-signals')
-async def check_signals(request: Request):
+async def _run_check(tf: str) -> dict:
     start = datetime.now()
-    tf = request.query_params.get('tf', '15m')
-    if tf not in TF_MS:
-        return JSONResponse({'error': f'Invalid timeframe: {tf}'}, status_code=400)
+    supabase = get_db()
 
-    try:
-        supabase = get_db()
+    all_bars = await fetch_bars(tf)
+    if not all_bars:
+        return {'error': 'No data from yfinance', 'signalsCreated': 0, 'positionsClosed': 0}
 
-        all_bars = await fetch_bars(tf)
-        if not all_bars:
-            return JSONResponse({'error': 'No data from yfinance', 'signalsCreated': 0, 'positionsClosed': 0})
+    bars_by_date = group_bars_by_date(all_bars)
+    date_keys = sorted(bars_by_date.keys())
+    if len(date_keys) < 2:
+        return {'error': 'Need at least 2 trading days', 'signalsCreated': 0, 'positionsClosed': 0}
 
-        bars_by_date = group_bars_by_date(all_bars)
-        date_keys = sorted(bars_by_date.keys())
-        if len(date_keys) < 2:
-            return JSONResponse({'error': 'Need at least 2 trading days', 'signalsCreated': 0, 'positionsClosed': 0})
+    vol_avgs = compute_volume_avg(all_bars, 20)
 
-        vol_avgs = compute_volume_avg(all_bars, 20)
+    vwap_by_day = {}
+    pdh_pdl_by_day = {}
+    for d, dk in enumerate(date_keys):
+        day_bars = bars_by_date[dk]
+        vwap_by_day[dk] = compute_vwap(day_bars)
+        if d > 0:
+            prev_bars = bars_by_date[date_keys[d - 1]]
+            pdh_pdl_by_day[dk] = compute_pdh_pdl(prev_bars)
 
-        vwap_by_day = {}
-        pdh_pdl_by_day = {}
-        for d, dk in enumerate(date_keys):
-            day_bars = bars_by_date[dk]
-            vwap_by_day[dk] = compute_vwap(day_bars)
-            if d > 0:
-                prev_bars = bars_by_date[date_keys[d - 1]]
-                pdh_pdl_by_day[dk] = compute_pdh_pdl(prev_bars)
+    now = datetime.now(timezone.utc)
+    utc_minutes = now.hour * 60 + now.minute
+    is_past_cutoff = utc_minutes >= CUTOFF_UTC_MINUTES
 
-        now = datetime.now(timezone.utc)
-        utc_minutes = now.hour * 60 + now.minute
-        is_past_cutoff = utc_minutes >= CUTOFF_UTC_MINUTES
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    today_end = today_start.replace(hour=23, minute=59, second=59)
 
-        today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-        today_end = today_start.replace(hour=23, minute=59, second=59)
+    today_count_resp = supabase.table('trades') \
+        .select('id', count='exact') \
+        .gte('entered_at', today_start.isoformat()) \
+        .lte('entered_at', today_end.isoformat()) \
+        .execute()
+    today_trades_count = today_count_resp.count or 0
 
-        today_count_resp = supabase.table('trades') \
-            .select('id', count='exact') \
-            .gte('entered_at', today_start.isoformat()) \
-            .lte('entered_at', today_end.isoformat()) \
-            .execute()
-        today_trades_count = today_count_resp.count or 0
+    open_count_resp = supabase.table('open_positions') \
+        .select('id', count='exact') \
+        .execute()
+    open_count = open_count_resp.count or 0
 
-        open_count_resp = supabase.table('open_positions') \
-            .select('id', count='exact') \
-            .execute()
-        open_count = open_count_resp.count or 0
+    total_trades_today = today_trades_count + open_count
 
-        total_trades_today = today_trades_count + open_count
+    today_key = now.strftime('%Y-%m-%d')
+    today_bars = bars_by_date.get(today_key)
+    prev_key = date_keys[date_keys.index(today_key) - 1] if today_key in date_keys and date_keys.index(today_key) > 0 else None
+    pdh_pdl_today = pdh_pdl_by_day.get(today_key) if prev_key else None
 
-        today_key = now.strftime('%Y-%m-%d')
-        today_bars = bars_by_date.get(today_key)
-        prev_key = date_keys[date_keys.index(today_key) - 1] if today_key in date_keys and date_keys.index(today_key) > 0 else None
-        pdh_pdl_today = pdh_pdl_by_day.get(today_key) if prev_key else None
-
-        new_signals = []
-        if today_bars and pdh_pdl_today:
+    new_signals = []
+    if today_bars and pdh_pdl_today:
             vwaps_today = vwap_by_day.get(today_key, [])
             if vwaps_today:
                 for i in range(SKIP_FIRST_N_BARS, len(today_bars)):
@@ -277,8 +271,62 @@ async def check_signals(request: Request):
             'totalTradesToday': total_trades_today,
         }
 
+
+@app.get('/api/cron/check-signals')
+async def check_signals(request: Request):
+    tf = request.query_params.get('tf', '15m')
+    if tf not in TF_MS:
+        return JSONResponse({'error': f'Invalid timeframe: {tf}'}, status_code=400)
+    try:
+        result = await _run_check(tf)
+        if 'error' in result:
+            return JSONResponse(result, status_code=500)
+        return result
     except Exception as e:
         return JSONResponse({'error': str(e), 'signalsCreated': 0, 'positionsClosed': 0}, status_code=500)
+
+
+@app.get('/api/export/signals.csv')
+async def export_signals_csv():
+    try:
+        supabase = get_db()
+    except RuntimeError:
+        return JSONResponse({'error': 'Missing Supabase env vars'}, status_code=500)
+    data = (supabase.table('signals').select('*').order('detected_at', desc=True).execute()).data or []
+    if not data:
+        return HTMLResponse('No data', status_code=404)
+    cols = ['id','detected_at','trade_date','timeframe','bar_time','direction','entry_price','sl_price','tp_price','pdh','pdl','pdr','vwap','volume','vol_avg','status','exit_price','pnl','costs','net_pnl','exit_reason','closed_at']
+    def esc(v): v = str(v); return f'"{v}"' if ',' in v or '"' in v else v
+    lines = [','.join(cols)]
+    for r in data:
+        lines.append(','.join(esc(r.get(c,'')) for c in cols))
+    return HTMLResponse('\n'.join(lines), headers={'Content-Type': 'text/csv', 'Content-Disposition': 'attachment; filename=signals.csv'})
+
+
+@app.get('/api/export/trades.csv')
+async def export_trades_csv():
+    try:
+        supabase = get_db()
+    except RuntimeError:
+        return JSONResponse({'error': 'Missing Supabase env vars'}, status_code=500)
+    data = (supabase.table('trades').select('*').order('exited_at', desc=True).execute()).data or []
+    if not data:
+        return HTMLResponse('No data', status_code=404)
+    cols = ['id','signal_id','timeframe','trade_date','direction','entry_price','exit_price','sl_price','tp_price','quantity','pnl','brokerage','stt','exchange_charges','sebi_charges','gst','stamp_duty','total_costs','net_pnl','exit_reason','entered_at','exited_at']
+    def esc(v): v = str(v); return f'"{v}"' if ',' in v or '"' in v else v
+    lines = [','.join(cols)]
+    for r in data:
+        lines.append(','.join(esc(r.get(c,'')) for c in cols))
+    return HTMLResponse('\n'.join(lines), headers={'Content-Type': 'text/csv', 'Content-Disposition': 'attachment; filename=trades.csv'})
+
+
+@app.get('/api/cron/check-all')
+async def check_all():
+    results = {}
+    for tf in ['1m', '5m', '15m']:
+        result = await _run_check(tf)
+        results[tf] = result
+    return results
 
 
 @app.get('/', response_class=HTMLResponse)

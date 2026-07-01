@@ -16,31 +16,11 @@ services:
         sync: false
 
   - type: cron
-    name: s50-check-signals-1m
+    name: s50-check-all
     runtime: python
     region: singapore
     plan: free
     branch: master
-    schedule: "*/5 * * * *"
+    schedule: "*/15 * * * *"
     buildCommand: pip install -r requirements.txt
-    startCommand: python -c "import httpx; r=httpx.get('https://s50-forward-test.onrender.com/api/cron/check-signals?tf=1m'); print(r.text)"
-
-  - type: cron
-    name: s50-check-signals-5m
-    runtime: python
-    region: singapore
-    plan: free
-    branch: master
-    schedule: "*/5 * * * *"
-    buildCommand: pip install -r requirements.txt
-    startCommand: python -c "import httpx; r=httpx.get('https://s50-forward-test.onrender.com/api/cron/check-signals?tf=5m'); print(r.text)"
-
-  - type: cron
-    name: s50-check-signals-15m
-    runtime: python
-    region: singapore
-    plan: free
-    branch: master
-    schedule: "*/5 * * * *"
-    buildCommand: pip install -r requirements.txt
-    startCommand: python -c "import httpx; r=httpx.get('https://s50-forward-test.onrender.com/api/cron/check-signals?tf=15m'); print(r.text)"
+    startCommand: python -c "import httpx; r=httpx.get('https://s50-forward-test.onrender.com/api/cron/check-all', timeout=120); print(r.text)"
