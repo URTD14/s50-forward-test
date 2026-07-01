@@ -70,54 +70,51 @@ async def check_signals(request: Request):
 
         total_trades_today = today_trades_count + open_count
 
+        today_key = now.strftime('%Y-%m-%d')
+        today_bars = bars_by_date.get(today_key)
+        prev_key = date_keys[date_keys.index(today_key) - 1] if today_key in date_keys and date_keys.index(today_key) > 0 else None
+        pdh_pdl_today = pdh_pdl_by_day.get(today_key) if prev_key else None
+
         new_signals = []
-        for d in range(1, len(date_keys)):
-            curr_dk = date_keys[d]
-            pdh_pdl = pdh_pdl_by_day.get(curr_dk)
-            if not pdh_pdl:
-                continue
+        if today_bars and pdh_pdl_today:
+            vwaps_today = vwap_by_day.get(today_key, [])
+            if vwaps_today:
+                for i in range(SKIP_FIRST_N_BARS, len(today_bars)):
+                    bar = today_bars[i]
+                    try:
+                        global_idx = all_bars.index(bar)
+                    except ValueError:
+                        continue
+                    if global_idx >= len(vol_avgs):
+                        continue
 
-            curr_bars = bars_by_date[curr_dk]
-            vwaps = vwap_by_day.get(curr_dk, [])
-            if not vwaps:
-                continue
+                    vol_avg = vol_avgs[global_idx]
+                    if vol_avg <= 0:
+                        continue
 
-            for i in range(SKIP_FIRST_N_BARS, len(curr_bars)):
-                bar = curr_bars[i]
-                try:
-                    global_idx = all_bars.index(bar)
-                except ValueError:
-                    continue
-                if global_idx >= len(vol_avgs):
-                    continue
+                    bar_utc = bar['date'].hour * 60 + bar['date'].minute
+                    if bar_utc >= CUTOFF_UTC_MINUTES:
+                        continue
 
-                vol_avg = vol_avgs[global_idx]
-                if vol_avg <= 0:
-                    continue
+                    sig = check_signal(bar, pdh_pdl_today['pdh'], pdh_pdl_today['pdl'], pdh_pdl_today['pdr'], vwaps_today[i], vol_avg)
+                    if not sig:
+                        continue
 
-                bar_utc = bar['date'].hour * 60 + bar['date'].minute
-                if bar_utc >= CUTOFF_UTC_MINUTES:
-                    continue
+                    if total_trades_today + len(new_signals) >= MAX_TRADES_PER_DAY:
+                        continue
 
-                sig = check_signal(bar, pdh_pdl['pdh'], pdh_pdl['pdl'], pdh_pdl['pdr'], vwaps[i], vol_avg)
-                if not sig:
-                    continue
+                    existing = supabase.table('signals') \
+                        .select('id') \
+                        .eq('timeframe', tf) \
+                        .eq('bar_time', bar['date'].isoformat()) \
+                        .eq('direction', sig['direction']) \
+                        .maybe_single() \
+                        .execute()
 
-                if total_trades_today + len(new_signals) >= MAX_TRADES_PER_DAY:
-                    continue
+                    if existing.data:
+                        continue
 
-                existing = supabase.table('signals') \
-                    .select('id') \
-                    .eq('timeframe', tf) \
-                    .eq('bar_time', bar['date'].isoformat()) \
-                    .eq('direction', sig['direction']) \
-                    .maybe_single() \
-                    .execute()
-
-                if existing.data:
-                    continue
-
-                new_signals.append({'signal': sig, 'date_key': curr_dk, 'bar': bar, 'pdh_pdl': pdh_pdl, 'vwap_val': vwaps[i], 'vol_avg_val': vol_avg})
+                    new_signals.append({'signal': sig, 'date_key': today_key, 'bar': bar, 'pdh_pdl': pdh_pdl_today, 'vwap_val': vwaps_today[i], 'vol_avg_val': vol_avg})
 
         signals_created = 0
         for ns in new_signals:
