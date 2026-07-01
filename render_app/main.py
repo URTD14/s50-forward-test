@@ -14,13 +14,25 @@ app = FastAPI()
 
 CAPITAL = 15000
 MAX_TRADES_PER_DAY = 10
-CUTOFF_UTC_MINUTES = 9 * 60 + 45
+CUTOFF_UTC_MINUTES = 9 * 60 + 45  # 15:15 IST
+NSE_OPEN_UTC = 3 * 60 + 45  # 09:15 IST
+NSE_CLOSE_UTC = 10 * 60 + 0  # 15:30 IST
 TF_MS = {'1m': 60000, '5m': 300000, '15m': 900000}
 SKIP_FIRST_N_BARS = 20
 
 
+def is_market_open() -> bool:
+    now = datetime.now(timezone.utc)
+    if now.weekday() >= 5:
+        return False
+    mins = now.hour * 60 + now.minute
+    return NSE_OPEN_UTC <= mins < NSE_CLOSE_UTC
+
+
 async def _run_check(tf: str) -> dict:
     start = datetime.now()
+    if not is_market_open():
+        return {'error': 'Market closed', 'signalsCreated': 0, 'positionsClosed': 0}
     supabase = get_db()
 
     all_bars = await fetch_bars(tf)
