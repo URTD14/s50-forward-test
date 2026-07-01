@@ -33,6 +33,7 @@ async def _run_check(tf: str) -> dict:
     start = datetime.now()
     if not is_market_open():
         return {'error': 'Market closed', 'signalsCreated': 0, 'positionsClosed': 0}
+
     supabase = get_db()
 
     all_bars = await fetch_bars(tf)
@@ -62,18 +63,13 @@ async def _run_check(tf: str) -> dict:
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     today_end = today_start.replace(hour=23, minute=59, second=59)
 
-    today_count_resp = supabase.table('trades') \
-        .select('id', count='exact') \
-        .gte('entered_at', today_start.isoformat()) \
-        .lte('entered_at', today_end.isoformat()) \
-        .execute()
+    today_count_resp = supabase.table('trades').select('id', count='exact')\
+        .gte('entered_at', today_start.isoformat())\
+        .lte('entered_at', today_end.isoformat()).execute()
     today_trades_count = today_count_resp.count or 0
 
-    open_count_resp = supabase.table('open_positions') \
-        .select('id', count='exact') \
-        .execute()
+    open_count_resp = supabase.table('open_positions').select('id', count='exact').execute()
     open_count = open_count_resp.count or 0
-
     total_trades_today = today_trades_count + open_count
 
     today_key = now.strftime('%Y-%m-%d')
@@ -83,205 +79,135 @@ async def _run_check(tf: str) -> dict:
 
     new_signals = []
     if today_bars and pdh_pdl_today:
-            vwaps_today = vwap_by_day.get(today_key, [])
-            if vwaps_today:
-                for i in range(SKIP_FIRST_N_BARS, len(today_bars)):
-                    bar = today_bars[i]
-                    try:
-                        global_idx = all_bars.index(bar)
-                    except ValueError:
-                        continue
-                    if global_idx >= len(vol_avgs):
-                        continue
+        vwaps_today = vwap_by_day.get(today_key, [])
+        if vwaps_today:
+            for i in range(SKIP_FIRST_N_BARS, len(today_bars)):
+                bar = today_bars[i]
+                try:
+                    global_idx = all_bars.index(bar)
+                except ValueError:
+                    continue
+                if global_idx >= len(vol_avgs):
+                    continue
+                vol_avg = vol_avgs[global_idx]
+                if vol_avg <= 0:
+                    continue
+                bar_utc = bar['date'].hour * 60 + bar['date'].minute
+                if bar_utc >= CUTOFF_UTC_MINUTES:
+                    continue
+                sig = check_signal(bar, pdh_pdl_today['pdh'], pdh_pdl_today['pdl'], pdh_pdl_today['pdr'], vwaps_today[i], vol_avg)
+                if not sig:
+                    continue
+                if total_trades_today + len(new_signals) >= MAX_TRADES_PER_DAY:
+                    continue
+                existing = supabase.table('signals').select('id')\
+                    .eq('timeframe', tf).eq('bar_time', bar['date'].isoformat())\
+                    .eq('direction', sig['direction']).maybe_single().execute()
+                if existing.data:
+                    continue
+                new_signals.append({'signal': sig, 'date_key': today_key, 'bar': bar,
+                    'pdh_pdl': pdh_pdl_today, 'vwap_val': vwaps_today[i], 'vol_avg_val': vol_avg})
 
-                    vol_avg = vol_avgs[global_idx]
-                    if vol_avg <= 0:
-                        continue
+    signals_created = 0
+    for ns in new_signals:
+        sig = ns['signal']
+        qty = max(1, int(CAPITAL / sig['entry']))
+        now_iso = datetime.now(timezone.utc).isoformat()
+        bar_time_iso = ns['bar']['date'].isoformat()
 
-                    bar_utc = bar['date'].hour * 60 + bar['date'].minute
-                    if bar_utc >= CUTOFF_UTC_MINUTES:
-                        continue
+        sig_resp = supabase.table('signals').insert({
+            'timeframe': tf, 'trade_date': ns['date_key'], 'direction': sig['direction'],
+            'bar_time': bar_time_iso, 'entry_price': sig['entry'], 'sl_price': sig['sl'],
+            'tp_price': sig['tp'], 'pdh': ns['pdh_pdl']['pdh'], 'pdl': ns['pdh_pdl']['pdl'],
+            'pdr': ns['pdh_pdl']['pdr'], 'vwap': ns['vwap_val'], 'volume': ns['bar']['volume'],
+            'vol_avg': ns['vol_avg_val'], 'status': 'active',
+        }).execute()
 
-                    sig = check_signal(bar, pdh_pdl_today['pdh'], pdh_pdl_today['pdl'], pdh_pdl_today['pdr'], vwaps_today[i], vol_avg)
-                    if not sig:
-                        continue
+        if not sig_resp.data:
+            continue
+        sig_id = sig_resp.data[0]['id']
+        pos_resp = supabase.table('open_positions').insert({
+            'signal_id': sig_id, 'timeframe': tf, 'trade_date': ns['date_key'],
+            'direction': sig['direction'], 'entry_price': sig['entry'],
+            'sl_price': sig['sl'], 'tp_price': sig['tp'], 'quantity': qty,
+            'entered_at': now_iso,
+        }).execute()
+        if not pos_resp.error:
+            signals_created += 1
 
-                    if total_trades_today + len(new_signals) >= MAX_TRADES_PER_DAY:
-                        continue
+    open_positions_resp = supabase.table('open_positions').select('*').eq('timeframe', tf).execute()
+    open_positions = open_positions_resp.data or []
 
-                    existing = supabase.table('signals') \
-                        .select('id') \
-                        .eq('timeframe', tf) \
-                        .eq('bar_time', bar['date'].isoformat()) \
-                        .eq('direction', sig['direction']) \
-                        .maybe_single() \
-                        .execute()
+    positions_closed = 0
+    closed_details = []
 
-                    if existing.data:
-                        continue
+    for pos in open_positions:
+        signal_resp = supabase.table('signals').select('bar_time').eq('id', pos['signal_id']).maybe_single().execute()
+        if not signal_resp.data:
+            continue
+        signal_bar_time = datetime.fromisoformat(signal_resp.data['bar_time'])
+        bars_after = [b for b in all_bars if b['date'].timestamp() > signal_bar_time.timestamp()]
 
-                    new_signals.append({'signal': sig, 'date_key': today_key, 'bar': bar, 'pdh_pdl': pdh_pdl_today, 'vwap_val': vwaps_today[i], 'vol_avg_val': vol_avg})
+        hit = None
+        for bar in bars_after:
+            if pos['direction'] == 'BUY':
+                if bar['low'] <= float(pos['sl_price']):
+                    hit = {'price': float(pos['sl_price']), 'reason': 'sl_hit'}; break
+                if bar['high'] >= float(pos['tp_price']):
+                    hit = {'price': float(pos['tp_price']), 'reason': 'tp_hit'}; break
+            else:
+                if bar['high'] >= float(pos['sl_price']):
+                    hit = {'price': float(pos['sl_price']), 'reason': 'sl_hit'}; break
+                if bar['low'] <= float(pos['tp_price']):
+                    hit = {'price': float(pos['tp_price']), 'reason': 'tp_hit'}; break
 
-        signals_created = 0
-        for ns in new_signals:
-            sig = ns['signal']
-            qty = max(1, int(CAPITAL / sig['entry']))
-            now_iso = datetime.now(timezone.utc).isoformat()
-            bar_time_iso = ns['bar']['date'].isoformat()
+        if not hit and is_past_cutoff:
+            last_bar = all_bars[-1]
+            if last_bar:
+                hit = {'price': last_bar['close'], 'reason': 'cutoff'}
 
-            sig_resp = supabase.table('signals') \
-                .insert({
-                    'timeframe': tf,
-                    'trade_date': ns['date_key'],
-                    'direction': sig['direction'],
-                    'bar_time': bar_time_iso,
-                    'entry_price': sig['entry'],
-                    'sl_price': sig['sl'],
-                    'tp_price': sig['tp'],
-                    'pdh': ns['pdh_pdl']['pdh'],
-                    'pdl': ns['pdh_pdl']['pdl'],
-                    'pdr': ns['pdh_pdl']['pdr'],
-                    'vwap': ns['vwap_val'],
-                    'volume': ns['bar']['volume'],
-                    'vol_avg': ns['vol_avg_val'],
-                    'status': 'active',
-                }) \
-                .execute()
+        if hit:
+            qty = int(pos['quantity'])
+            entry = float(pos['entry_price'])
+            exit_price = hit['price']
+            gross = qty * (exit_price - entry) if pos['direction'] == 'BUY' else qty * (entry - exit_price)
+            costs = zerodha_cost(qty, entry, exit_price)
+            net = gross - costs['total']
+            trade_date = pos.get('trade_date', pos['entered_at'][:10])
 
-            if not sig_resp.data:
-                continue
+            supabase.table('trades').insert({
+                'signal_id': pos['signal_id'], 'timeframe': pos['timeframe'], 'trade_date': trade_date,
+                'direction': pos['direction'], 'entry_price': entry, 'exit_price': exit_price,
+                'sl_price': float(pos['sl_price']), 'tp_price': float(pos['tp_price']),
+                'quantity': qty, 'pnl': round(gross, 2), 'brokerage': costs['brokerage'],
+                'stt': costs['stt'], 'exchange_charges': costs['exchange_charges'],
+                'sebi_charges': costs['sebi_charges'], 'gst': costs['gst'],
+                'stamp_duty': costs['stamp_duty'], 'total_costs': costs['total'],
+                'net_pnl': round(net, 2), 'exit_reason': hit['reason'],
+                'entered_at': pos['entered_at'], 'exited_at': datetime.now(timezone.utc).isoformat(),
+            }).execute()
 
-            sig_id = sig_resp.data[0]['id']
-            pos_resp = supabase.table('open_positions') \
-                .insert({
-                    'signal_id': sig_id,
-                    'timeframe': tf,
-                    'trade_date': ns['date_key'],
-                    'direction': sig['direction'],
-                    'entry_price': sig['entry'],
-                    'sl_price': sig['sl'],
-                    'tp_price': sig['tp'],
-                    'quantity': qty,
-                    'entered_at': now_iso,
-                }) \
-                .execute()
+            supabase.table('signals').update({
+                'status': 'closed', 'exit_price': exit_price, 'pnl': round(gross, 2),
+                'costs': costs['total'], 'net_pnl': round(net, 2), 'exit_reason': hit['reason'],
+                'closed_at': datetime.now(timezone.utc).isoformat(),
+            }).eq('id', pos['signal_id']).execute()
 
-            if not pos_resp.error:
-                signals_created += 1
+            supabase.table('open_positions').delete().eq('id', pos['id']).execute()
 
-        open_positions_resp = supabase.table('open_positions') \
-            .select('*') \
-            .eq('timeframe', tf) \
-            .execute()
-        open_positions = open_positions_resp.data or []
+            positions_closed += 1
+            closed_details.append({'id': pos['id'], 'reason': hit['reason'], 'pnl': round(net, 2)})
 
-        positions_closed = 0
-        closed_details = []
+    elapsed = (datetime.now() - start).total_seconds() * 1000
+    remaining = len(open_positions) - positions_closed
 
-        for pos in open_positions:
-            signal_resp = supabase.table('signals') \
-                .select('bar_time') \
-                .eq('id', pos['signal_id']) \
-                .maybe_single() \
-                .execute()
-            if not signal_resp.data:
-                continue
-
-            signal_bar_time = datetime.fromisoformat(signal_resp.data['bar_time'])
-            bars_after = [b for b in all_bars if b['date'].timestamp() > signal_bar_time.timestamp()]
-
-            hit = None
-            for bar in bars_after:
-                if pos['direction'] == 'BUY':
-                    if bar['low'] <= float(pos['sl_price']):
-                        hit = {'price': float(pos['sl_price']), 'reason': 'sl_hit'}
-                        break
-                    if bar['high'] >= float(pos['tp_price']):
-                        hit = {'price': float(pos['tp_price']), 'reason': 'tp_hit'}
-                        break
-                else:
-                    if bar['high'] >= float(pos['sl_price']):
-                        hit = {'price': float(pos['sl_price']), 'reason': 'sl_hit'}
-                        break
-                    if bar['low'] <= float(pos['tp_price']):
-                        hit = {'price': float(pos['tp_price']), 'reason': 'tp_hit'}
-                        break
-
-            if not hit and is_past_cutoff:
-                last_bar = all_bars[-1]
-                if last_bar:
-                    hit = {'price': last_bar['close'], 'reason': 'cutoff'}
-
-            if hit:
-                qty = int(pos['quantity'])
-                entry = float(pos['entry_price'])
-                exit_price = hit['price']
-                gross = qty * (exit_price - entry) if pos['direction'] == 'BUY' else qty * (entry - exit_price)
-                costs = zerodha_cost(qty, entry, exit_price)
-                net = gross - costs['total']
-                trade_date = pos.get('trade_date', pos['entered_at'][:10])
-
-                supabase.table('trades') \
-                    .insert({
-                        'signal_id': pos['signal_id'],
-                        'timeframe': pos['timeframe'],
-                        'trade_date': trade_date,
-                        'direction': pos['direction'],
-                        'entry_price': entry,
-                        'exit_price': exit_price,
-                        'sl_price': float(pos['sl_price']),
-                        'tp_price': float(pos['tp_price']),
-                        'quantity': qty,
-                        'pnl': round(gross, 2),
-                        'brokerage': costs['brokerage'],
-                        'stt': costs['stt'],
-                        'exchange_charges': costs['exchange_charges'],
-                        'sebi_charges': costs['sebi_charges'],
-                        'gst': costs['gst'],
-                        'stamp_duty': costs['stamp_duty'],
-                        'total_costs': costs['total'],
-                        'net_pnl': round(net, 2),
-                        'exit_reason': hit['reason'],
-                        'entered_at': pos['entered_at'],
-                        'exited_at': datetime.now(timezone.utc).isoformat(),
-                    }) \
-                    .execute()
-
-                supabase.table('signals') \
-                    .update({
-                        'status': 'closed',
-                        'exit_price': exit_price,
-                        'pnl': round(gross, 2),
-                        'costs': costs['total'],
-                        'net_pnl': round(net, 2),
-                        'exit_reason': hit['reason'],
-                        'closed_at': datetime.now(timezone.utc).isoformat(),
-                    }) \
-                    .eq('id', pos['signal_id']) \
-                    .execute()
-
-                supabase.table('open_positions') \
-                    .delete() \
-                    .eq('id', pos['id']) \
-                    .execute()
-
-                positions_closed += 1
-                closed_details.append({'id': pos['id'], 'reason': hit['reason'], 'pnl': round(net, 2)})
-
-        elapsed = (datetime.now() - start).total_seconds() * 1000
-        remaining = len(open_positions) - positions_closed
-
-        return {
-            'timeframe': tf,
-            'elapsedMs': int(elapsed),
-            'signalsCreated': signals_created,
-            'positionsClosed': positions_closed,
-            'closedDetails': closed_details,
-            'openRemaining': remaining,
-            'barsProcessed': len(all_bars),
-            'pastCutoff': is_past_cutoff,
-            'totalTradesToday': total_trades_today,
-        }
+    return {
+        'timeframe': tf, 'elapsedMs': int(elapsed),
+        'signalsCreated': signals_created, 'positionsClosed': positions_closed,
+        'closedDetails': closed_details, 'openRemaining': remaining,
+        'barsProcessed': len(all_bars), 'pastCutoff': is_past_cutoff,
+        'totalTradesToday': total_trades_today,
+    }
 
 
 @app.get('/api/cron/check-signals')
