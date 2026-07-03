@@ -68,14 +68,14 @@ async def _clean_stale_positions(supabase, all_bars):
                         'stt': costs['stt'], 'exchange_charges': costs['exchange_charges'],
                         'sebi_charges': costs['sebi_charges'], 'gst': costs['gst'],
                         'stamp_duty': costs['stamp_duty'], 'total_costs': costs['total'],
-                        'net_pnl': round(net, 2), 'exit_reason': 'stale_cleared',
+                        'net_pnl': round(net, 2), 'exit_reason': 'cutoff',
                         'entered_at': pos['entered_at'],
                         'exited_at': datetime.now(timezone.utc).isoformat(),
                     }).execute()
                     supabase.table('signals').update({
                         'status': 'closed', 'exit_price': round(exit_price, 2),
                         'pnl': round(gross, 2), 'costs': costs['total'],
-                        'net_pnl': round(net, 2), 'exit_reason': 'stale_cleared',
+                        'net_pnl': round(net, 2), 'exit_reason': 'cutoff',
                         'closed_at': datetime.now(timezone.utc).isoformat(),
                     }).eq('id', pos['signal_id']).execute()
                     supabase.table('open_positions').delete().eq('id', pos['id']).execute()
@@ -254,14 +254,14 @@ async def _run_check(tf: str) -> dict:
                 'stt': costs['stt'], 'exchange_charges': costs['exchange_charges'],
                 'sebi_charges': costs['sebi_charges'], 'gst': costs['gst'],
                 'stamp_duty': costs['stamp_duty'], 'total_costs': costs['total'],
-                'net_pnl': round(net, 2), 'exit_reason': 'disabled_tf',
+                'net_pnl': round(net, 2), 'exit_reason': 'cutoff',
                 'entered_at': pos['entered_at'],
                 'exited_at': datetime.now(timezone.utc).isoformat(),
             }).execute()
             supabase.table('signals').update({
                 'status': 'closed', 'exit_price': round(exit_price, 2),
                 'pnl': round(gross, 2), 'costs': costs['total'],
-                'net_pnl': round(net, 2), 'exit_reason': 'disabled_tf',
+                'net_pnl': round(net, 2), 'exit_reason': 'cutoff',
                 'closed_at': datetime.now(timezone.utc).isoformat(),
             }).eq('id', pos['signal_id']).execute()
             supabase.table('open_positions').delete().eq('id', pos['id']).execute()
@@ -441,7 +441,7 @@ async def cleanup_stale():
                     'stt': costs['stt'], 'exchange_charges': costs['exchange_charges'],
                     'sebi_charges': costs['sebi_charges'], 'gst': costs['gst'],
                     'stamp_duty': costs['stamp_duty'], 'total_costs': costs['total'],
-                    'net_pnl': round(net, 2), 'exit_reason': 'disabled_tf',
+                    'net_pnl': round(net, 2), 'exit_reason': 'cutoff',
                     'entered_at': pos['entered_at'],
                     'exited_at': datetime.now(timezone.utc).isoformat(),
                 }).execute()
@@ -454,7 +454,7 @@ async def cleanup_stale():
                 supabase.table('signals').update({
                     'status': 'closed', 'exit_price': exit_price,
                     'pnl': 0.0, 'costs': costs['total'],
-                    'net_pnl': round(net, 2), 'exit_reason': 'disabled_tf',
+                    'net_pnl': round(net, 2), 'exit_reason': 'cutoff',
                     'closed_at': datetime.now(timezone.utc).isoformat(),
                 }).eq('id', pos['signal_id']).execute()
                 logger.info(f'Signal {pos["signal_id"]} updated')
