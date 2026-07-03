@@ -8,10 +8,11 @@ on:
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 3
+    timeout-minutes: 4
     steps:
-      - name: Check all timeframes
-        run: |
-          URL="https://s50-forward-test.onrender.com/api/cron/check-all"
-          echo "Calling: $URL"
-          curl -s --max-time 120 "$URL" || echo "Request failed (timeout or error)"
+      - name: Check 1m
+        run: curl -s --max-time 30 "https://s50-forward-test.onrender.com/api/cron/check-signals?tf=1m" || echo "1m failed"
+      - name: Check 5m
+        run: curl -s --max-time 30 "https://s50-forward-test.onrender.com/api/cron/check-signals?tf=5m" || echo "5m failed"
+      - name: Check 15m
+        run: curl -s --max-time 30 "https://s50-forward-test.onrender.com/api/cron/check-signals?tf=15m" || echo "15m failed"

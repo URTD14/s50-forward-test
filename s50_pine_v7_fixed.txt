@@ -1,0 +1,102 @@
+//@version=6
+strategy("S50 Intraday Breakout (v7 - Limit Entry)", 
+         overlay=true, 
+         initial_capital=15000, 
+         default_qty_type=strategy.cash, 
+         default_qty_value=15000)
+
+// --- Inputs ---
+risk_pct   = input.float(0.75, title="Risk Pct (Range Multiplier)")
+rr         = input.float(1.0, title="Risk Reward Ratio")
+vol_mult   = input.float(1.5, title="Volume Multiplier")
+max_trades = input.int(10, title="Max Trades Per Day")
+
+// --- Daily Levels ---
+pdh_raw   = request.security(syminfo.tickerid, "D", high, barmerge.gaps_off, barmerge.lookahead_off)
+pdl_raw   = request.security(syminfo.tickerid, "D", low, barmerge.gaps_off, barmerge.lookahead_off)
+
+var float pdh = na
+var float pdl = na
+if ta.change(time("D")) != 0
+    pdh := pdh_raw[1]
+    pdl := pdl_raw[1]
+
+pdrng = pdh - pdl
+
+// --- Intraday VWAP ---
+var float cum_tp_v = 0.0
+var float cum_v    = 0.0
+
+if ta.change(time("D")) != 0
+    cum_tp_v := 0.0
+    cum_v    := 0.0
+
+typical_price = (high + low + close) / 3.0
+cum_tp_v     += typical_price * volume
+cum_v        += volume
+my_vwap       = cum_v > 0 ? cum_tp_v / cum_v : na
+
+// --- Volume Avg ---
+va = ta.sma(volume, 20)
+
+// --- State ---
+var int daily_trade_count = 0
+var int skip_until_bar = 0
+
+if ta.change(time("D")) != 0
+    daily_trade_count := 0
+
+in_session = (hour < 15) or (hour == 15 and minute < 15)
+is_market_close = (hour == 15 and minute >= 15) or (hour > 15)
+
+// --- Conditions ---
+vol_condition = not na(va) and va > 0 and volume >= (vol_mult * va) and not na(my_vwap)
+valid_range   = not na(pdrng) and pdrng >= 0.05
+can_trade = (bar_index >= skip_until_bar) and (daily_trade_count < max_trades) and in_session and vol_condition and valid_range
+
+var float sl = na
+var float tp = na
+var bool trigger_long_arrow = false
+var bool trigger_short_arrow = false
+trigger_long_arrow := false
+trigger_short_arrow := false
+
+// --- Entry (LIMIT at PDH/PDL — matches Python backtest) ---
+if can_trade
+    if high > pdh and close > my_vwap
+        float ep = pdh
+        float risk = pdrng * risk_pct
+        sl := ep - risk
+        tp := ep + (rr * risk)
+        float exact_qty = math.max(math.floor(15000 / ep), 0)
+        if exact_qty > 0
+            strategy.order("Long", strategy.long, qty=exact_qty, limit=ep)
+            daily_trade_count += 1
+            trigger_long_arrow := true
+
+    else if low < pdl and close < my_vwap
+        float ep = pdl
+        float risk = pdrng * risk_pct
+        sl := ep + risk
+        tp := ep - (rr * risk)
+        float exact_qty = math.max(math.floor(15000 / ep), 0)
+        if exact_qty > 0
+            strategy.order("Short", strategy.short, qty=exact_qty, limit=ep)
+            daily_trade_count += 1
+            trigger_short_arrow := true
+
+// --- Exit ---
+if strategy.position_size != 0
+    if is_market_close
+        strategy.close_all(comment="Forced EOD Close")
+        skip_until_bar := bar_index + 1
+    else
+        strategy.exit("Exit", stop=sl, limit=tp)
+        if ta.change(strategy.position_size) != 0
+            skip_until_bar := bar_index + 1
+
+// --- Plots ---
+plotshape(trigger_long_arrow,  title="Long Entry",  style=shape.triangleup,   location=location.belowbar, color=color.green, size=size.normal)
+plotshape(trigger_short_arrow, title="Short Entry", style=shape.triangledown, location=location.abovebar, color=color.red,   size=size.normal)
+plot(strategy.position_size != 0 ? tp : na, title="TP", color=color.lime,  style=plot.style_linebr, linewidth=2)
+plot(strategy.position_size != 0 ? sl : na, title="SL", color=color.maroon, style=plot.style_linebr, linewidth=2)
