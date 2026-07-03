@@ -225,8 +225,9 @@ async def _run_check(tf: str) -> dict:
         open_positions = []
 
     try:
-        disabled_pos_resp = supabase.table('open_positions').select('*').not_.in_('timeframe', ACTIVE_TF).execute()
-        disabled_positions = disabled_pos_resp.data if disabled_pos_resp else []
+        all_open_resp = supabase.table('open_positions').select('*').execute()
+        all_open = all_open_resp.data if all_open_resp else []
+        disabled_positions = [p for p in all_open if p.get('timeframe') not in ACTIVE_TF]
     except Exception:
         disabled_positions = []
 
@@ -399,6 +400,56 @@ async def export_trades_csv():
     for r in data:
         lines.append(','.join(esc(r.get(c,'')) for c in cols))
     return HTMLResponse('\n'.join(lines), headers={'Content-Type': 'text/csv', 'Content-Disposition': 'attachment; filename=trades.csv'})
+
+
+@app.get('/api/cron/cleanup')
+async def cleanup_stale():
+    try:
+        supabase = get_db()
+    except RuntimeError as e:
+        return JSONResponse({'error': f'Supabase: {e}'}, status_code=500)
+    try:
+        all_bars = await fetch_bars('5m')
+    except Exception:
+        all_bars = []
+    await _clean_stale_positions(supabase, all_bars or [])
+    try:
+        all_open_resp = supabase.table('open_positions').select('*').execute()
+        for pos in (all_open_resp.data or []):
+            if pos.get('timeframe') not in ACTIVE_TF:
+                try:
+                    entry = float(pos['entry_price'])
+                    direction = pos['direction']
+                    qty = int(pos['quantity'])
+                    exit_price = entry
+                    gross = qty * (exit_price - entry) if direction == 'BUY' else qty * (entry - exit_price)
+                    costs = zerodha_cost(qty, entry, exit_price)
+                    net = gross - costs['total']
+                    supabase.table('trades').insert({
+                        'signal_id': pos['signal_id'], 'timeframe': pos['timeframe'],
+                        'trade_date': pos.get('trade_date', pos['entered_at'][:10]),
+                        'direction': direction, 'entry_price': entry, 'exit_price': exit_price,
+                        'sl_price': float(pos['sl_price']), 'tp_price': float(pos['tp_price']),
+                        'quantity': qty, 'pnl': 0.0, 'brokerage': costs['brokerage'],
+                        'stt': costs['stt'], 'exchange_charges': costs['exchange_charges'],
+                        'sebi_charges': costs['sebi_charges'], 'gst': costs['gst'],
+                        'stamp_duty': costs['stamp_duty'], 'total_costs': costs['total'],
+                        'net_pnl': round(net, 2), 'exit_reason': 'disabled_tf',
+                        'entered_at': pos['entered_at'],
+                        'exited_at': datetime.now(timezone.utc).isoformat(),
+                    }).execute()
+                    supabase.table('signals').update({
+                        'status': 'closed', 'exit_price': exit_price,
+                        'pnl': 0.0, 'costs': costs['total'],
+                        'net_pnl': round(net, 2), 'exit_reason': 'disabled_tf',
+                        'closed_at': datetime.now(timezone.utc).isoformat(),
+                    }).eq('id', pos['signal_id']).execute()
+                    supabase.table('open_positions').delete().eq('id', pos['id']).execute()
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return {'cleaned': True}
 
 
 @app.get('/api/cron/check-all')
