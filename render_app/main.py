@@ -153,7 +153,7 @@ async def _run_check(tf: str) -> dict:
             }).execute()
         except Exception:
             continue
-        if pos_resp and not pos_resp.error:
+        if pos_resp:
             signals_created += 1
 
     try:
