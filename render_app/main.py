@@ -13,12 +13,14 @@ from .supabase_db import get_db
 app = FastAPI()
 
 CAPITAL = 15000
-MAX_TRADES_PER_DAY = 10
-CUTOFF_UTC_MINUTES = 9 * 60 + 45  # 15:15 IST
-NSE_OPEN_UTC = 3 * 60 + 45  # 09:15 IST
-NSE_CLOSE_UTC = 10 * 60 + 0  # 15:30 IST
-TF_MS = {'1m': 60000, '5m': 300000, '15m': 900000}
+MAX_TRADES_PER_DAY = 1
+TICK = 0.05
+CUTOFF_UTC_MINUTES = 9 * 60 + 45
+NSE_OPEN_UTC = 3 * 60 + 45
+NSE_CLOSE_UTC = 10 * 60 + 0
+TF_MS = {'5m': 300000, '15m': 900000}
 SKIP_FIRST_N_BARS = 20
+ACTIVE_TF = ['5m', '15m']
 
 
 def is_market_open() -> bool:
@@ -29,8 +31,65 @@ def is_market_open() -> bool:
     return NSE_OPEN_UTC <= mins < NSE_CLOSE_UTC
 
 
+def apply_slippage(price: float, direction: str, side: str) -> float:
+    """side='entry': BUY pays more, SELL gets less. side='exit': opposite."""
+    if side == 'entry':
+        return price + TICK if direction == 'BUY' else price - TICK
+    else:
+        return price - TICK if direction == 'BUY' else price + TICK
+
+
+async def _clean_stale_positions(supabase, all_bars):
+    """Force-close any open positions from previous days."""
+    try:
+        positions = supabase.table('open_positions').select('*').execute()
+        if not positions or not positions.data:
+            return
+        for pos in positions.data:
+            try:
+                trade_date = pos.get('trade_date', '')
+                today_str = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+                if trade_date and trade_date < today_str:
+                    entry = float(pos['entry_price'])
+                    direction = pos['direction']
+                    qty = int(pos['quantity'])
+                    last_bar = all_bars[-1] if all_bars else None
+                    exit_price = last_bar['close'] if last_bar else entry
+                    exit_price = apply_slippage(exit_price, direction, 'exit')
+                    gross = qty * (exit_price - entry) if direction == 'BUY' else qty * (entry - exit_price)
+                    costs = zerodha_cost(qty, entry, exit_price)
+                    net = gross - costs['total']
+                    supabase.table('trades').insert({
+                        'signal_id': pos['signal_id'], 'timeframe': pos['timeframe'],
+                        'trade_date': pos['trade_date'], 'direction': direction,
+                        'entry_price': entry, 'exit_price': round(exit_price, 2),
+                        'sl_price': float(pos['sl_price']), 'tp_price': float(pos['tp_price']),
+                        'quantity': qty, 'pnl': round(gross, 2), 'brokerage': costs['brokerage'],
+                        'stt': costs['stt'], 'exchange_charges': costs['exchange_charges'],
+                        'sebi_charges': costs['sebi_charges'], 'gst': costs['gst'],
+                        'stamp_duty': costs['stamp_duty'], 'total_costs': costs['total'],
+                        'net_pnl': round(net, 2), 'exit_reason': 'stale_cleared',
+                        'entered_at': pos['entered_at'],
+                        'exited_at': datetime.now(timezone.utc).isoformat(),
+                    }).execute()
+                    supabase.table('signals').update({
+                        'status': 'closed', 'exit_price': round(exit_price, 2),
+                        'pnl': round(gross, 2), 'costs': costs['total'],
+                        'net_pnl': round(net, 2), 'exit_reason': 'stale_cleared',
+                        'closed_at': datetime.now(timezone.utc).isoformat(),
+                    }).eq('id', pos['signal_id']).execute()
+                    supabase.table('open_positions').delete().eq('id', pos['id']).execute()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
 async def _run_check(tf: str) -> dict:
     start = datetime.now()
+
+    if tf not in ACTIVE_TF:
+        return {'error': f'{tf} disabled — use 5m or 15m for realistic fills'}
     if not is_market_open():
         return {'error': 'Market closed', 'signalsCreated': 0, 'positionsClosed': 0}
 
@@ -46,13 +105,14 @@ async def _run_check(tf: str) -> dict:
     if not all_bars:
         return {'error': 'No data from yfinance', 'signalsCreated': 0, 'positionsClosed': 0}
 
+    await _clean_stale_positions(supabase, all_bars)
+
     bars_by_date = group_bars_by_date(all_bars)
     date_keys = sorted(bars_by_date.keys())
     if len(date_keys) < 2:
         return {'error': 'Need at least 2 trading days', 'signalsCreated': 0, 'positionsClosed': 0}
 
     vol_avgs = compute_volume_avg(all_bars, 20)
-
     vwap_by_day = {}
     pdh_pdl_by_day = {}
     for d, dk in enumerate(date_keys):
@@ -130,6 +190,8 @@ async def _run_check(tf: str) -> dict:
         now_iso = datetime.now(timezone.utc).isoformat()
         bar_time_iso = ns['bar']['date'].isoformat()
 
+        entry_fill = apply_slippage(sig['entry'], sig['direction'], 'entry')
+
         try:
             sig_resp = supabase.table('signals').insert({
                 'timeframe': tf, 'trade_date': ns['date_key'], 'direction': sig['direction'],
@@ -138,7 +200,7 @@ async def _run_check(tf: str) -> dict:
                 'pdr': ns['pdh_pdl']['pdr'], 'vwap': ns['vwap_val'], 'volume': ns['bar']['volume'],
                 'vol_avg': ns['vol_avg_val'], 'status': 'active',
             }).execute()
-        except Exception as e:
+        except Exception:
             continue
 
         if not sig_resp or not sig_resp.data or len(sig_resp.data) < 1:
@@ -147,7 +209,7 @@ async def _run_check(tf: str) -> dict:
         try:
             pos_resp = supabase.table('open_positions').insert({
                 'signal_id': sig_id, 'timeframe': tf, 'trade_date': ns['date_key'],
-                'direction': sig['direction'], 'entry_price': sig['entry'],
+                'direction': sig['direction'], 'entry_price': round(entry_fill, 2),
                 'sl_price': sig['sl'], 'tp_price': sig['tp'], 'quantity': qty,
                 'entered_at': now_iso,
             }).execute()
@@ -162,8 +224,50 @@ async def _run_check(tf: str) -> dict:
     except Exception:
         open_positions = []
 
+    try:
+        disabled_pos_resp = supabase.table('open_positions').select('*').not_.in_('timeframe', ACTIVE_TF).execute()
+        disabled_positions = disabled_pos_resp.data if disabled_pos_resp else []
+    except Exception:
+        disabled_positions = []
+
     positions_closed = 0
     closed_details = []
+
+    for pos in disabled_positions:
+        try:
+            entry = float(pos['entry_price'])
+            direction = pos['direction']
+            qty = int(pos['quantity'])
+            last_bar = all_bars[-1] if all_bars else None
+            exit_price = last_bar['close'] if last_bar else entry
+            exit_price = apply_slippage(exit_price, direction, 'exit')
+            gross = qty * (exit_price - entry) if direction == 'BUY' else qty * (entry - exit_price)
+            costs = zerodha_cost(qty, entry, exit_price)
+            net = gross - costs['total']
+            supabase.table('trades').insert({
+                'signal_id': pos['signal_id'], 'timeframe': pos['timeframe'],
+                'trade_date': pos.get('trade_date', pos['entered_at'][:10]),
+                'direction': direction, 'entry_price': entry, 'exit_price': round(exit_price, 2),
+                'sl_price': float(pos['sl_price']), 'tp_price': float(pos['tp_price']),
+                'quantity': qty, 'pnl': round(gross, 2), 'brokerage': costs['brokerage'],
+                'stt': costs['stt'], 'exchange_charges': costs['exchange_charges'],
+                'sebi_charges': costs['sebi_charges'], 'gst': costs['gst'],
+                'stamp_duty': costs['stamp_duty'], 'total_costs': costs['total'],
+                'net_pnl': round(net, 2), 'exit_reason': 'disabled_tf',
+                'entered_at': pos['entered_at'],
+                'exited_at': datetime.now(timezone.utc).isoformat(),
+            }).execute()
+            supabase.table('signals').update({
+                'status': 'closed', 'exit_price': round(exit_price, 2),
+                'pnl': round(gross, 2), 'costs': costs['total'],
+                'net_pnl': round(net, 2), 'exit_reason': 'disabled_tf',
+                'closed_at': datetime.now(timezone.utc).isoformat(),
+            }).eq('id', pos['signal_id']).execute()
+            supabase.table('open_positions').delete().eq('id', pos['id']).execute()
+            positions_closed += 1
+            closed_details.append({'id': pos['id'], 'reason': 'disabled_tf', 'pnl': round(net, 2)})
+        except Exception:
+            pass
 
     for pos in open_positions:
         try:
@@ -176,28 +280,37 @@ async def _run_check(tf: str) -> dict:
         bars_after = [b for b in all_bars if b['date'].timestamp() > signal_bar_time.timestamp()]
 
         hit = None
+        sl_val = float(pos['sl_price'])
+        tp_val = float(pos['tp_price'])
+        direction = pos['direction']
+
         for bar in bars_after:
-            if pos['direction'] == 'BUY':
-                if bar['low'] <= float(pos['sl_price']):
-                    hit = {'price': float(pos['sl_price']), 'reason': 'sl_hit'}; break
-                if bar['high'] >= float(pos['tp_price']):
-                    hit = {'price': float(pos['tp_price']), 'reason': 'tp_hit'}; break
+            if direction == 'BUY':
+                if bar['low'] <= sl_val:
+                    hit = {'price': apply_slippage(sl_val, 'BUY', 'exit'), 'reason': 'sl_hit'}
+                    break
+                if bar['high'] >= tp_val:
+                    hit = {'price': apply_slippage(tp_val, 'BUY', 'exit'), 'reason': 'tp_hit'}
+                    break
             else:
-                if bar['high'] >= float(pos['sl_price']):
-                    hit = {'price': float(pos['sl_price']), 'reason': 'sl_hit'}; break
-                if bar['low'] <= float(pos['tp_price']):
-                    hit = {'price': float(pos['tp_price']), 'reason': 'tp_hit'}; break
+                if bar['high'] >= sl_val:
+                    hit = {'price': apply_slippage(sl_val, 'SELL', 'exit'), 'reason': 'sl_hit'}
+                    break
+                if bar['low'] <= tp_val:
+                    hit = {'price': apply_slippage(tp_val, 'SELL', 'exit'), 'reason': 'tp_hit'}
+                    break
 
         if not hit and is_past_cutoff:
             last_bar = all_bars[-1] if all_bars else None
             if last_bar:
-                hit = {'price': last_bar['close'], 'reason': 'cutoff'}
+                exit_price = apply_slippage(last_bar['close'], direction, 'exit')
+                hit = {'price': round(exit_price, 2), 'reason': 'cutoff'}
 
         if hit:
             qty = int(pos['quantity'])
             entry = float(pos['entry_price'])
             exit_price = hit['price']
-            gross = qty * (exit_price - entry) if pos['direction'] == 'BUY' else qty * (entry - exit_price)
+            gross = qty * (exit_price - entry) if direction == 'BUY' else qty * (entry - exit_price)
             costs = zerodha_cost(qty, entry, exit_price)
             net = gross - costs['total']
             trade_date = pos.get('trade_date', pos['entered_at'][:10])
@@ -205,8 +318,8 @@ async def _run_check(tf: str) -> dict:
             try:
                 supabase.table('trades').insert({
                     'signal_id': pos['signal_id'], 'timeframe': pos['timeframe'], 'trade_date': trade_date,
-                    'direction': pos['direction'], 'entry_price': entry, 'exit_price': exit_price,
-                    'sl_price': float(pos['sl_price']), 'tp_price': float(pos['tp_price']),
+                    'direction': direction, 'entry_price': entry, 'exit_price': round(exit_price, 2),
+                    'sl_price': sl_val, 'tp_price': tp_val,
                     'quantity': qty, 'pnl': round(gross, 2), 'brokerage': costs['brokerage'],
                     'stt': costs['stt'], 'exchange_charges': costs['exchange_charges'],
                     'sebi_charges': costs['sebi_charges'], 'gst': costs['gst'],
@@ -216,7 +329,7 @@ async def _run_check(tf: str) -> dict:
                 }).execute()
 
                 supabase.table('signals').update({
-                    'status': 'closed', 'exit_price': exit_price, 'pnl': round(gross, 2),
+                    'status': 'closed', 'exit_price': round(exit_price, 2), 'pnl': round(gross, 2),
                     'costs': costs['total'], 'net_pnl': round(net, 2), 'exit_reason': hit['reason'],
                     'closed_at': datetime.now(timezone.utc).isoformat(),
                 }).eq('id', pos['signal_id']).execute()
@@ -291,7 +404,7 @@ async def export_trades_csv():
 @app.get('/api/cron/check-all')
 async def check_all():
     results = {}
-    for tf in ['1m', '5m', '15m']:
+    for tf in ACTIVE_TF:
         try:
             result = await _run_check(tf)
         except Exception as e:
@@ -331,7 +444,7 @@ async def dashboard():
         except: return str(x)
 
     rows_tf = ''
-    for tf in ['1m', '5m', '15m']:
+    for tf in ACTIVE_TF:
         tt = [t for t in trades if t['timeframe'] == tf]
         tw = sum(1 for t in tt if float(t['pnl']) > 0)
         tl = len(tt) - tw
@@ -424,6 +537,9 @@ async def dashboard():
     html += '.c{display:none}.c.active{display:block}'
     html += '.empty{color:#64748b;font-style:italic;padding:20px 0}'
     html += '</style></head><body><div class="container">'
+    html += '<div style="background:#1e3a5f;border:1px solid #3b82f6;border-radius:8px;padding:12px;margin-bottom:16px;font-size:0.85rem;color:#93c5fd;line-height:1.6">'
+    html += '<strong>⚠ Data:</strong> Yahoo 15-min delay &middot; Entries/exits include Rs 0.05 slippage &middot; Max 1 trade/day &middot; 1m disabled (unrealistic with delay)'
+    html += '</div>'
     html += '<h1>S50 Forward Test</h1>'
     html += f'<p class="subtitle">IDEA.NS &middot; {total} trades &middot; {wr}% win rate &middot; {fmt(np)}</p>'
     html += '<div class="grid">'
