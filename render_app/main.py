@@ -404,52 +404,76 @@ async def export_trades_csv():
 
 @app.get('/api/cron/cleanup')
 async def cleanup_stale():
+    import logging
+    logger = logging.getLogger('cleanup')
     try:
         supabase = get_db()
     except RuntimeError as e:
+        logger.error(f'Supabase error: {e}')
         return JSONResponse({'error': f'Supabase: {e}'}, status_code=500)
-    try:
-        all_bars = await fetch_bars('5m')
-    except Exception:
-        all_bars = []
-    await _clean_stale_positions(supabase, all_bars or [])
+    cleaned = 0
+    errors = []
     try:
         all_open_resp = supabase.table('open_positions').select('*').execute()
-        for pos in (all_open_resp.data or []):
-            if pos.get('timeframe') not in ACTIVE_TF:
-                try:
-                    entry = float(pos['entry_price'])
-                    direction = pos['direction']
-                    qty = int(pos['quantity'])
-                    exit_price = entry
-                    gross = qty * (exit_price - entry) if direction == 'BUY' else qty * (entry - exit_price)
-                    costs = zerodha_cost(qty, entry, exit_price)
-                    net = gross - costs['total']
-                    supabase.table('trades').insert({
-                        'signal_id': pos['signal_id'], 'timeframe': pos['timeframe'],
-                        'trade_date': pos.get('trade_date', pos['entered_at'][:10]),
-                        'direction': direction, 'entry_price': entry, 'exit_price': exit_price,
-                        'sl_price': float(pos['sl_price']), 'tp_price': float(pos['tp_price']),
-                        'quantity': qty, 'pnl': 0.0, 'brokerage': costs['brokerage'],
-                        'stt': costs['stt'], 'exchange_charges': costs['exchange_charges'],
-                        'sebi_charges': costs['sebi_charges'], 'gst': costs['gst'],
-                        'stamp_duty': costs['stamp_duty'], 'total_costs': costs['total'],
-                        'net_pnl': round(net, 2), 'exit_reason': 'disabled_tf',
-                        'entered_at': pos['entered_at'],
-                        'exited_at': datetime.now(timezone.utc).isoformat(),
-                    }).execute()
-                    supabase.table('signals').update({
-                        'status': 'closed', 'exit_price': exit_price,
-                        'pnl': 0.0, 'costs': costs['total'],
-                        'net_pnl': round(net, 2), 'exit_reason': 'disabled_tf',
-                        'closed_at': datetime.now(timezone.utc).isoformat(),
-                    }).eq('id', pos['signal_id']).execute()
-                    supabase.table('open_positions').delete().eq('id', pos['id']).execute()
-                except Exception:
-                    pass
-    except Exception:
-        pass
-    return {'cleaned': True}
+        positions = all_open_resp.data or []
+        logger.info(f'Found {len(positions)} total open positions')
+    except Exception as e:
+        logger.error(f'Fetch positions failed: {e}')
+        return JSONResponse({'cleaned': 0, 'error': str(e)})
+    for pos in positions:
+        if pos.get('timeframe') in ACTIVE_TF:
+            continue
+        try:
+            entry = float(pos['entry_price'])
+            direction = pos['direction']
+            qty = int(pos['quantity'])
+            exit_price = entry
+            gross = qty * (exit_price - entry) if direction == 'BUY' else qty * (entry - exit_price)
+            costs = zerodha_cost(qty, entry, exit_price)
+            net = gross - costs['total']
+            try:
+                tr = supabase.table('trades').insert({
+                    'signal_id': pos['signal_id'], 'timeframe': pos['timeframe'],
+                    'trade_date': pos.get('trade_date', pos['entered_at'][:10]),
+                    'direction': direction, 'entry_price': entry, 'exit_price': exit_price,
+                    'sl_price': float(pos['sl_price']), 'tp_price': float(pos['tp_price']),
+                    'quantity': qty, 'pnl': 0.0, 'brokerage': costs['brokerage'],
+                    'stt': costs['stt'], 'exchange_charges': costs['exchange_charges'],
+                    'sebi_charges': costs['sebi_charges'], 'gst': costs['gst'],
+                    'stamp_duty': costs['stamp_duty'], 'total_costs': costs['total'],
+                    'net_pnl': round(net, 2), 'exit_reason': 'disabled_tf',
+                    'entered_at': pos['entered_at'],
+                    'exited_at': datetime.now(timezone.utc).isoformat(),
+                }).execute()
+                logger.info(f'Trade inserted for pos {pos["id"]}')
+            except Exception as e:
+                logger.error(f'Trade insert failed for pos {pos["id"]}: {e}')
+                errors.append(f'trade_insert pos {pos["id"]}: {e}')
+                continue
+            try:
+                supabase.table('signals').update({
+                    'status': 'closed', 'exit_price': exit_price,
+                    'pnl': 0.0, 'costs': costs['total'],
+                    'net_pnl': round(net, 2), 'exit_reason': 'disabled_tf',
+                    'closed_at': datetime.now(timezone.utc).isoformat(),
+                }).eq('id', pos['signal_id']).execute()
+                logger.info(f'Signal {pos["signal_id"]} updated')
+            except Exception as e:
+                logger.error(f'Signal update failed for pos {pos["id"]}: {e}')
+                errors.append(f'signal_update pos {pos["id"]}: {e}')
+                continue
+            try:
+                supabase.table('open_positions').delete().eq('id', pos['id']).execute()
+                logger.info(f'Position {pos["id"]} deleted')
+            except Exception as e:
+                logger.error(f'Position delete failed for pos {pos["id"]}: {e}')
+                errors.append(f'pos_delete pos {pos["id"]}: {e}')
+                continue
+            cleaned += 1
+        except Exception as e:
+            logger.error(f'Processing pos {pos["id"]} failed: {e}')
+            errors.append(f'process pos {pos["id"]}: {e}')
+    return {'cleaned': cleaned, 'errors': errors}
 
 
 @app.get('/api/cron/check-all')
